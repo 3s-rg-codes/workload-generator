@@ -3,28 +3,76 @@ import Queue from 'k6/x/amqp/queue';
 import { Random } from 'k6/x/random';
 import { shuffle } from 'k6/x/random';
 import encoding from 'k6/encoding';
+import { randomIntBetween } from 'https://jslib.k6.io/k6-utils/1.2.0/index.js';
+import exec from 'k6/execution';
 
-export default function () {
-    const rabbitmqUrl = 'amqp://default_user_R2FyGcaNfptuccG1Q9I:avE5SLyCsFsVysLDzmq_FM9vbJvjaxEF@host.docker.internal:5672';
-    const queueName = 'my_new_queue';
+// Validate required environment variables
+const REQUIRED_ENV_VARS = ['ENDPOINT', 'RABBITMQ_USER', 'RABBITMQ_PASS', 'INVOICES_PER_SECOND', 'MID_ITEMS_PER_INVOICE', 'MIN_ITEMS_PER_INVOICE', 'MAX_ITEMS_PER_INVOICE'];
+const queueName = 'my_new_queue';
+const connIds = new Map();
 
-    // Start AMQP connection
-    Amqp.start({ connection_url: rabbitmqUrl });
-    console.log("Connection opened: " + rabbitmqUrl);
+export let options = {
+    scenarios: {
+        'publish-invoices': {
+            executor: 'ramping-arrival-rate',
+            preAllocatedVUs: 10,
+            maxVUs: 50,
+            startRate: Number(__ENV.INVOICES_PER_SECOND),
+            timeUnit: '1s',
+            stages: [
+                { target: Number(__ENV.INVOICES_PER_SECOND), duration: '10s' },
+            ],
+        },
+    },
+};
 
-    // Declare the queue
+function getConnectionId(vuId) {
+    if (!connIds.has(vuId)) {
+        const rabbitmqUrl = `amqp://${__ENV.RABBITMQ_USER}:${__ENV.RABBITMQ_PASS}@${__ENV.ENDPOINT}`;
+        const connectionId = Amqp.start({ connection_url: rabbitmqUrl });
+        connIds.set(vuId, connectionId);
+    }
+    return connIds.get(vuId);
+}
+
+export function setup() {
+    REQUIRED_ENV_VARS.forEach(varName => {
+        if (!__ENV[varName]) {
+            throw new Error(`Missing required environment variable: ${varName}`);
+        }
+    });
+
+    const rabbitmqUrl = `amqp://${__ENV.RABBITMQ_USER}:${__ENV.RABBITMQ_PASS}@${__ENV.ENDPOINT}`;
+    // amqp://default_user_R2FyGcaNfptuccG1Q9I:avE5SLyCsFsVysLDzmq_FM9vbJvjaxEF@host.docker.internal:5672
+    const connectionId = Amqp.start({ connection_url: rabbitmqUrl });
+    connIds.set('setup', connectionId); // Store setup connection for queue declaration
+
     Queue.declare({
+        connection_id: connectionId,
         name: queueName,
         durable: true,
         args: {
             'x-queue-type': 'quorum',
         },
     });
+}
 
-    console.log(queueName + " queue is ready");
+export default function () {
 
+    const vuId = exec.vu.idInInstance;
+    const connectionId = getConnectionId(vuId); // Retrieve the specific VU connection ID
+
+
+    let invoice;
     // Generate a random invoice
-    const invoice = generateInvoice();
+    if (randomIntBetween(1, 3) % 3 == 1) {
+        invoice = generateInvoice(Number(__ENV.MAX_ITEMS_PER_INVOICE));
+    } else if (randomIntBetween(1, 3) % 3 == 2) {
+        invoice = generateInvoice(Number(__ENV.MID_ITEMS_PER_INVOICE));
+    } else {
+        invoice = generateInvoice(Number(__ENV.MIN_ITEMS_PER_INVOICE));
+    }
+
 
     // Create the CloudEvent
     const cloudEvent = {
@@ -37,29 +85,44 @@ export default function () {
     };
 
     // Publish the CloudEvent
-    Amqp.publish({
-        queue_name: queueName,
-        body: JSON.stringify(cloudEvent),
-        content_type: "application/json", // Use the correct content type
-    });
-
-    console.log("CloudEvent sent: " + JSON.stringify(cloudEvent));
-}
-
-function generateRandomDigits(length) {
-    let digits = '';
-    for (let i = 0; i < length; i++) {
-        digits += Math.floor(Math.random() * 10);
+    try {
+        Amqp.publish({
+            connection_id: connectionId,  // Specify the VU connection ID
+            queue_name: queueName,
+            body: JSON.stringify(cloudEvent),
+            content_type: "application/json",
+        });
+        console.log("CloudEvent sent successfully!");
+    } catch (error) {
+        console.error("Failed to send CloudEvent:", error);
     }
-    return digits;
+    //JSON.stringify(cloudEvent)
 }
 
-function generateInvoice() {
+export function teardown() {
+    // Close all connections established during the test
+    connIds.forEach((connectionId, key) => {
+        Amqp.close(connectionId);
+        console.log(`AMQP connection closed for ${key}`);
+    });
+}
+
+
+function generateInvoice(itemCount) {
     let rng = new Random();
 
     const sellerNames = ['ABC Corp', 'XYZ Ltd', '123 LLC', 'Tech Innovations', 'Creative Solutions'];
     const buyerNames = ['Client A', 'Client B', 'Client C', 'Client D', 'Client E'];
     const itemDescriptions = ['Widget A', 'Gadget B', 'Service C', 'Product D', 'Tool E'];
+    const validIbans = [
+        "DE89370400440532013000", // Commerzbank
+        "DE45700500003901190315"
+
+    ];
+    shuffle(validIbans);
+    const selectedIban = validIbans[0];
+
+
 
     shuffle(sellerNames);
     const sellerName = sellerNames[0];
@@ -68,11 +131,10 @@ function generateInvoice() {
     const buyerName = buyerNames[0];
 
     const items = [];
-    const itemCount = rng.intBetween(1, 10);
     let baseAmount = 0;
 
     for (let i = 0; i < itemCount; i++) {
-        const shuffledDescriptions = [...itemDescriptions];
+        const shuffledDescriptions = itemDescriptions;
         shuffle(shuffledDescriptions);
         const description = shuffledDescriptions[0];
 
@@ -96,7 +158,7 @@ function generateInvoice() {
         seller: {
             name: sellerName,
             address: '123 Business St, Business City, BC 12345',
-            iban: 'DE' + generateRandomDigits(20),
+            iban: selectedIban,
             bic: generateRandomDigits(8),
             bank: 'Business Bank',
         },
@@ -120,4 +182,12 @@ function generateInvoice() {
         reverseCharge: rng.boolean(),
         dueDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
     };
+}
+
+function generateRandomDigits(length) {
+    let digits = '';
+    for (let i = 0; i < length; i++) {
+        digits += Math.floor(Math.random() * 10);
+    }
+    return digits;
 }

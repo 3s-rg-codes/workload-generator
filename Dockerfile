@@ -10,6 +10,15 @@ RUN xk6 build --with github.com/grafana/xk6-amqp@latest --with github.com/oleiad
 # Use a minimal Alpine image for runtime
 FROM alpine:3.15
 
+# Set environment variables
+ENV ENDPOINT="host.docker.internal:5672" \
+    RABBITMQ_USER="default_user_R2FyGcaNfptuccG1Q9I" \
+    RABBITMQ_PASS="avE5SLyCsFsVysLDzmq_FM9vbJvjaxEF" \
+    INVOICES_PER_SECOND="1" \
+    MID_ITEMS_PER_INVOICE="5" \
+    MIN_ITEMS_PER_INVOICE="1" \
+    MAX_ITEMS_PER_INVOICE="10"
+
 # Copy the custom k6 binary from the builder stage
 COPY --from=builder /go/k6 /usr/bin/k6
 
