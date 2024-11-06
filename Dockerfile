@@ -17,7 +17,8 @@ ENV ENDPOINT="host.docker.internal:5672" \
     INVOICES_PER_SECOND="1" \
     MID_ITEMS_PER_INVOICE="5" \
     MIN_ITEMS_PER_INVOICE="1" \
-    MAX_ITEMS_PER_INVOICE="10"
+    MAX_ITEMS_PER_INVOICE="10" \
+    GENERATE_LARGE_INVOICE="true"
 
 # Copy the custom k6 binary from the builder stage
 COPY --from=builder /go/k6 /usr/bin/k6

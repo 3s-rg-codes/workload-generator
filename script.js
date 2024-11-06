@@ -5,23 +5,32 @@ import { shuffle } from 'k6/x/random';
 import encoding from 'k6/encoding';
 import { randomIntBetween } from 'https://jslib.k6.io/k6-utils/1.2.0/index.js';
 import exec from 'k6/execution';
+import { SharedArray } from 'k6/data';
 
 // Validate required environment variables
-const REQUIRED_ENV_VARS = ['ENDPOINT', 'RABBITMQ_USER', 'RABBITMQ_PASS', 'INVOICES_PER_SECOND', 'MID_ITEMS_PER_INVOICE', 'MIN_ITEMS_PER_INVOICE', 'MAX_ITEMS_PER_INVOICE'];
+const REQUIRED_ENV_VARS = [
+    'ENDPOINT',
+    'RABBITMQ_USER',
+    'RABBITMQ_PASS',
+    'INVOICES_PER_SECOND',
+    'MID_ITEMS_PER_INVOICE',
+    'MIN_ITEMS_PER_INVOICE',
+    'MAX_ITEMS_PER_INVOICE',
+    'GENERATE_LARGE_INVOICE'
+];
+
 const queueName = 'my_new_queue';
 const connIds = new Map();
 
 export let options = {
     scenarios: {
         'publish-invoices': {
-            executor: 'ramping-arrival-rate',
+            executor: 'constant-arrival-rate',
             preAllocatedVUs: 10,
             maxVUs: 50,
-            startRate: Number(__ENV.INVOICES_PER_SECOND),
-            timeUnit: '1s',
-            stages: [
-                { target: Number(__ENV.INVOICES_PER_SECOND), duration: '10s' },
-            ],
+            rate: Number(__ENV.INVOICES_PER_SECOND),
+            duration: '10s',
+            timeUnit: '1s'
         },
     },
 };
@@ -43,7 +52,6 @@ export function setup() {
     });
 
     const rabbitmqUrl = `amqp://${__ENV.RABBITMQ_USER}:${__ENV.RABBITMQ_PASS}@${__ENV.ENDPOINT}`;
-    // amqp://default_user_R2FyGcaNfptuccG1Q9I:avE5SLyCsFsVysLDzmq_FM9vbJvjaxEF@host.docker.internal:5672
     const connectionId = Amqp.start({ connection_url: rabbitmqUrl });
     connIds.set('setup', connectionId); // Store setup connection for queue declaration
 
@@ -55,29 +63,41 @@ export function setup() {
             'x-queue-type': 'quorum',
         },
     });
-}
 
-export default function () {
-
-    const vuId = exec.vu.idInInstance;
-    const connectionId = getConnectionId(vuId); // Retrieve the specific VU connection ID
-
-
-    let invoice;
-    // Generate a random invoice
-    if (randomIntBetween(1, 3) % 3 == 1) {
-        invoice = generateInvoice(Number(__ENV.MAX_ITEMS_PER_INVOICE));
-    } else if (randomIntBetween(1, 3) % 3 == 2) {
-        invoice = generateInvoice(Number(__ENV.MID_ITEMS_PER_INVOICE));
-    } else {
-        invoice = generateInvoice(Number(__ENV.MIN_ITEMS_PER_INVOICE));
+    let preGeneratedLargeInvoice = null;
+    if (__ENV.GENERATE_LARGE_INVOICE && __ENV.GENERATE_LARGE_INVOICE.toLowerCase() === 'true') {
+        console.log('Pre-generating large invoice in setup...');
+        preGeneratedLargeInvoice = generateInvoice(100000);
     }
 
+    return { preGeneratedLargeInvoice };
+}
+
+export default function (data) {
+
+    const vuId = exec.vu.idInInstance;
+    const iteration = exec.vu.iterationInInstance;
+    const connectionId = getConnectionId(vuId);
+    let invoice;
+
+    // Send the large invoice exactly once, at the start of the first VU's first iteration
+    if (vuId === 1 && iteration === 0 && data.preGeneratedLargeInvoice) {
+        console.log(`Sending large invoice with 100,000 items.`);
+        invoice = data.preGeneratedLargeInvoice;
+    } else {
+        const rand = randomIntBetween(1, 3);
+        const itemCount = {
+            1: Number(__ENV.MAX_ITEMS_PER_INVOICE),
+            2: Number(__ENV.MID_ITEMS_PER_INVOICE),
+            3: Number(__ENV.MIN_ITEMS_PER_INVOICE)
+        }[rand];
+        invoice = generateInvoice(itemCount);
+    }
 
     // Create the CloudEvent
     const cloudEvent = {
         specversion: "1.0",
-        id: "ABC-123",
+        id: `INV-${exec.vu.iterationInInstance}-${exec.vu.idInInstance}-${Date.now()}`,
         source: "invoice",
         type: "invoice",
         datacontenttype: "application/json",
@@ -87,16 +107,15 @@ export default function () {
     // Publish the CloudEvent
     try {
         Amqp.publish({
-            connection_id: connectionId,  // Specify the VU connection ID
+            connection_id: connectionId,
             queue_name: queueName,
             body: JSON.stringify(cloudEvent),
             content_type: "application/json",
         });
-        console.log("CloudEvent sent successfully!");
+        console.log(`CloudEvent sent successfully! ID: ${cloudEvent.id}, Items: ${invoice.items.length}, Invoice Number: ${invoice.invoiceNumber}`);
     } catch (error) {
-        console.error("Failed to send CloudEvent:", error);
+        console.error(`Failed to send CloudEvent (ID: ${cloudEvent.id}):`, error);
     }
-    //JSON.stringify(cloudEvent)
 }
 
 export function teardown() {
@@ -119,14 +138,11 @@ function generateInvoice(itemCount) {
         "DE45700500003901190315"
 
     ];
+
     shuffle(validIbans);
     const selectedIban = validIbans[0];
-
-
-
     shuffle(sellerNames);
     const sellerName = sellerNames[0];
-
     shuffle(buyerNames);
     const buyerName = buyerNames[0];
 
@@ -134,9 +150,8 @@ function generateInvoice(itemCount) {
     let baseAmount = 0;
 
     for (let i = 0; i < itemCount; i++) {
-        const shuffledDescriptions = itemDescriptions;
-        shuffle(shuffledDescriptions);
-        const description = shuffledDescriptions[0];
+        shuffle(itemDescriptions);
+        const description = itemDescriptions[0];
 
         const quantity = rng.intBetween(1, 5);
         const price = rng.floatBetween(50.0, 500.0).toFixed(2);
